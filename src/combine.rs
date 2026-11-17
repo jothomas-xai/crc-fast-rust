@@ -31,6 +31,9 @@ fn shift(crc: u64, len: NonZeroU64, params: &CrcParams, powers: Option<&Powers>)
     {
         let has_constant_term = params.poly & 1 == 1;
         if has_constant_term && has_clmul() {
+            if let Some(instruction) = Crc32Instruction::of(params) {
+                return unsafe { shift_crc32(instruction, crc, len, params, powers) };
+            }
             match params.width {
                 64 => return unsafe { shift_clmul::<Width64>(crc, len, params, powers) },
                 32 => return unsafe { shift_clmul::<Width32>(crc, len, params, powers) },
@@ -55,6 +58,104 @@ fn has_clmul() -> bool {
         all(target_arch = "aarch64", target_feature = "aes"),
         all(target_feature = "sse4.1", target_feature = "pclmulqdq"),
     )) || !matches!(get_arch_ops(), ArchOpsInstance::SoftwareFallback)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+#[derive(Clone, Copy)]
+enum Crc32Instruction {
+    Castagnoli,
+    #[cfg(target_arch = "aarch64")]
+    Ieee,
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+impl Crc32Instruction {
+    #[inline(always)]
+    fn of(params: &CrcParams) -> Option<Self> {
+        const CASTAGNOLI: u64 = crate::crc32::consts::CRC32_ISCSI.poly;
+        #[cfg(target_arch = "aarch64")]
+        const IEEE: u64 = crate::crc32::consts::CRC32_ISO_HDLC.poly;
+        match (params.width, params.poly, params.refin) {
+            (32, CASTAGNOLI, true) if Self::is_supported() => Some(Self::Castagnoli),
+            #[cfg(target_arch = "aarch64")]
+            (32, IEEE, true) if Self::is_supported() => Some(Self::Ieee),
+            _ => None,
+        }
+    }
+
+    #[inline(always)]
+    fn is_supported() -> bool {
+        #[cfg(all(feature = "std", target_arch = "aarch64"))]
+        return std::arch::is_aarch64_feature_detected!("crc");
+        #[cfg(all(feature = "std", not(target_arch = "aarch64")))]
+        return std::arch::is_x86_feature_detected!("sse4.2");
+        #[cfg(not(feature = "std"))]
+        cfg!(any(target_feature = "crc", target_feature = "sse4.2"))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "aes,crc")]
+unsafe fn shift_crc32(
+    instruction: Crc32Instruction,
+    crc: u64,
+    len: NonZeroU64,
+    params: &CrcParams,
+    powers: Option<&Powers>,
+) -> u64 {
+    use core::arch::aarch64::{__crc32cw, __crc32w};
+    let ops = crate::arch::aarch64::aes::Aarch64AesOps;
+    let times_x32 = |value| match instruction {
+        Crc32Instruction::Castagnoli => __crc32cw(0, value),
+        Crc32Instruction::Ieee => __crc32w(0, value),
+    };
+    shift_crc32_with(&ops, times_x32, crc, len, params, powers)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+#[target_feature(enable = "sse4.2,pclmulqdq")]
+unsafe fn shift_crc32(
+    instruction: Crc32Instruction,
+    crc: u64,
+    len: NonZeroU64,
+    params: &CrcParams,
+    powers: Option<&Powers>,
+) -> u64 {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::_mm_crc32_u32;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::_mm_crc32_u32;
+    let ops = crate::arch::x86::sse::X86SsePclmulqdqOps;
+    let times_x32 = |value| match instruction {
+        Crc32Instruction::Castagnoli => _mm_crc32_u32(0, value),
+    };
+    shift_crc32_with(&ops, times_x32, crc, len, params, powers)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline(always)]
+unsafe fn shift_crc32_with<T: ArchOps>(
+    ops: &T,
+    times_x32: impl Fn(u32) -> u32,
+    crc: u64,
+    len: NonZeroU64,
+    params: &CrcParams,
+    powers: Option<&Powers>,
+) -> u64
+where
+    T::Vector: Copy,
+{
+    let multiply = |a: u64, b: u64| unsafe {
+        let product = ops.carryless_mul_00(
+            ops.create_vector_from_u64(a & 0xffff_ffff, false),
+            ops.create_vector_from_u64(b, false),
+        );
+        let product = ops.extract_u64s(product)[0];
+        u64::from(times_x32(product as u32)) ^ (product >> 32)
+    };
+    shift_with(multiply, crc, len, params, powers)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -346,11 +447,16 @@ mod tests {
     }
 
     fn all_params() -> Vec<CrcParams> {
-        let custom = [(16, 0x1337), (32, 0x1234567b), (64, 0x123456789abcdef1)]
-            .into_iter()
-            .flat_map(|(width, poly)| {
-                [false, true].map(|reflected| custom(width, poly, reflected))
-            });
+        let custom = [
+            (16, 0x1337),
+            (32, 0x1234567b),
+            (32, 0x1edc6f41),
+            (64, 0x04c11db7),
+            (64, 0x1edc6f41),
+            (64, 0x123456789abcdef1),
+        ]
+        .into_iter()
+        .flat_map(|(width, poly)| [false, true].map(|reflected| custom(width, poly, reflected)));
         TEST_ALL_CONFIGS
             .iter()
             .map(|config| *config.get_params())
