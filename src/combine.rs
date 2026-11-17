@@ -12,6 +12,8 @@ use crate::{
     structs::{CrcState, Width16, Width32, Width64},
     traits::{ArchOps, EnhancedCrcWidth},
 };
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+use core::marker::PhantomData;
 
 #[inline(always)]
 pub fn checksums(crc1: u64, crc2: u64, len2: u64, params: &CrcParams) -> u64 {
@@ -44,8 +46,7 @@ fn shift(crc: u64, len: NonZeroU64, params: &CrcParams, powers: Option<&Powers>)
 
 fn shift_software(crc: u64, len: NonZeroU64, params: &CrcParams, powers: Option<&Powers>) -> u64 {
     let modulus = Modulus::new(params.width, params.poly, params.refin);
-    let multiply = |a, b| modulus.multiply(a, b);
-    shift_with(multiply, crc & modulus.mask(), len, params, powers)
+    shift_with(&modulus, crc & modulus.mask(), len, params, powers)
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
@@ -102,49 +103,72 @@ where
     T::Vector: Copy,
     W::Value: Into<u64>,
 {
-    let (reflected, mu, poly) = (params.refin, params.get_key(7), params.get_key(8));
-    let multiply = |a, b| unsafe { multiply_clmul::<T, W>(ops, reflected, mu, poly, a, b) };
-    shift_with(multiply, crc, len, params, powers)
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
-#[inline(always)]
-unsafe fn multiply_clmul<T: ArchOps, W: EnhancedCrcWidth>(
-    ops: &T,
-    reflected: bool,
-    mu: u64,
-    poly: u64,
-    a: u64,
-    b: u64,
-) -> u64
-where
-    T::Vector: Copy,
-    W::Value: Into<u64>,
-{
-    let product = ops.carryless_mul_00(
-        ops.create_vector_from_u64(a & (u64::MAX >> (64 - W::WIDTH)), false),
-        ops.create_vector_from_u64(b << (64 - W::WIDTH), false),
-    );
-    let state = CrcState {
-        value: product,
-        reflected,
-    };
-    W::barrett_reduction(&state, poly, mu, ops).into()
+    shift_with(&Clmul::<T, W>::new(ops, params), crc, len, params, powers)
 }
 
 #[inline(always)]
-fn shift_with(
-    multiply: impl Fn(u64, u64) -> u64,
+fn shift_with<M: Multiply>(
+    multiplier: &M,
     crc: u64,
     len: NonZeroU64,
     params: &CrcParams,
     powers: Option<&Powers>,
 ) -> u64 {
     let factor = match powers {
-        Some(powers) => powers.factor(&multiply, len),
-        None => Modulus::new(params.width, params.poly, params.refin).factor(&multiply, len),
+        Some(powers) => powers.factor(multiplier, len),
+        None => Modulus::new(params.width, params.poly, params.refin).factor(multiplier, len),
     };
-    multiply(crc, factor)
+    multiplier.multiply(crc, factor)
+}
+
+trait Multiply {
+    fn multiply(&self, a: u64, b: u64) -> u64;
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+struct Clmul<'a, T, W> {
+    ops: &'a T,
+    reflected: bool,
+    mu: u64,
+    poly: u64,
+    width: PhantomData<W>,
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+impl<'a, T, W> Clmul<'a, T, W> {
+    #[inline(always)]
+    unsafe fn new(ops: &'a T, params: &CrcParams) -> Self {
+        Self {
+            ops,
+            reflected: params.refin,
+            mu: params.get_key(7),
+            poly: params.get_key(8),
+            width: PhantomData,
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+impl<T: ArchOps, W: EnhancedCrcWidth> Multiply for Clmul<'_, T, W>
+where
+    T::Vector: Copy,
+    W::Value: Into<u64>,
+{
+    #[inline(always)]
+    fn multiply(&self, a: u64, b: u64) -> u64 {
+        unsafe {
+            let product = self.ops.carryless_mul_00(
+                self.ops
+                    .create_vector_from_u64(a & (u64::MAX >> (64 - W::WIDTH)), false),
+                self.ops.create_vector_from_u64(b << (64 - W::WIDTH), false),
+            );
+            let state = CrcState {
+                value: product,
+                reflected: self.reflected,
+            };
+            W::barrett_reduction(&state, self.poly, self.mu, self.ops).into()
+        }
+    }
 }
 
 struct Modulus {
@@ -181,7 +205,7 @@ impl Modulus {
         }
     }
 
-    const fn multiply(&self, a: u64, b: u64) -> u64 {
+    const fn multiply_bitwise(&self, a: u64, b: u64) -> u64 {
         let mut product = 0;
         let mut bit = 0;
         while bit < self.width {
@@ -210,21 +234,27 @@ impl Modulus {
     }
 
     #[inline(always)]
-    fn factor(&self, multiply: impl Fn(u64, u64) -> u64, len: NonZeroU64) -> u64 {
+    fn factor<M: Multiply>(&self, multiplier: &M, len: NonZeroU64) -> u64 {
         let mut power = self.byte_shift();
         for _ in 0..len.trailing_zeros() {
-            power = multiply(power, power);
+            power = multiplier.multiply(power, power);
         }
         let mut factor = power;
         let mut rest = len.get() >> len.trailing_zeros() >> 1;
         while rest != 0 {
-            power = multiply(power, power);
+            power = multiplier.multiply(power, power);
             if rest & 1 == 1 {
-                factor = multiply(factor, power);
+                factor = multiplier.multiply(factor, power);
             }
             rest >>= 1;
         }
         factor
+    }
+}
+
+impl Multiply for Modulus {
+    fn multiply(&self, a: u64, b: u64) -> u64 {
+        self.multiply_bitwise(a, b)
     }
 }
 
@@ -245,10 +275,10 @@ impl Powers {
             table[digit][1] = power;
             let mut count = 2;
             while count < 16 {
-                table[digit][count] = modulus.multiply(table[digit][count - 1], power);
+                table[digit][count] = modulus.multiply_bitwise(table[digit][count - 1], power);
                 count += 1;
             }
-            power = modulus.multiply(table[digit][15], power);
+            power = modulus.multiply_bitwise(table[digit][15], power);
             digit += 1;
         }
         Self {
@@ -312,11 +342,11 @@ impl Powers {
     }
 
     #[inline(always)]
-    fn factor(&self, multiply: impl Fn(u64, u64) -> u64, len: NonZeroU64) -> u64 {
+    fn factor<M: Multiply>(&self, multiplier: &M, len: NonZeroU64) -> u64 {
         let mut digits = len.get();
         let mut factor = self.take(&mut digits);
         while digits != 0 {
-            factor = multiply(factor, self.take(&mut digits));
+            factor = multiplier.multiply(factor, self.take(&mut digits));
         }
         factor
     }
